@@ -31,39 +31,55 @@ def load_excel(file):
     return pd.read_excel(file, engine="openpyxl")
 
 def safe_rename(df):
-    """Map all cost/currency columns to unified names."""
-    col_map = {
-        # Manual Accruals + SAP TM
-        "Net Amt in Doc Crcy": "Cost",
-        "Net amt in doc crcy": "Cost",
+    """Map all cost/currency/date/route columns to unified names safely."""
 
-        # SAP ERP
-        "Loc.curr.amount": "Cost",
-        "Loc curr amount": "Cost",
+    rename_map = {}
 
-        # Currency fields
-        "Local Curr.": "Currency",
-        "Local Curr": "Currency",
-        "Currency": "Currency",
+    # Cost fields
+    for col in df.columns:
+        if col.strip().lower() in [
+            "net amt in doc crcy",
+            "net amt in doc crcy ",
+            "net amt",
+            "loc.curr.amount",
+            "loc curr amount",
+        ]:
+            rename_map[col] = "Cost"
 
-        # Date fields
-        "Deliv.Date": "Date",
-        "Actual Delivered Date": "Date",
+    # Currency fields
+    for col in df.columns:
+        if col.strip().lower() in ["local curr.", "local curr", "currency"]:
+            rename_map[col] = "Currency"
 
-        # Route fields
-        "Source location": "Source",
-        "Destination location": "Destination",
-        "Source Location Description": "Source",
-        "Destination Location Descripti": "Destination",
+    # Date fields
+    for col in df.columns:
+        if col.strip().lower() in ["deliv.date", "actual delivered date"]:
+            rename_map[col] = "Date"
 
-        # Carrier fields
-        "Carrier": "Carrier",
-        "Carrier Description": "Carrier",
+    # Carrier fields
+    for col in df.columns:
+        if col.strip().lower() in ["carrier", "carrier description"]:
+            rename_map[col] = "Carrier"
 
-        # Delivery type
-        "DlvTy": "DlvTy",
-    }
-    rename_map = {k: v for k, v in col_map.items() if k in df.columns}
+    # Delivery type
+    for col in df.columns:
+        if col.strip().lower() == "dlvty":
+            rename_map[col] = "DlvTy"
+
+    # Route fields — only FIRST becomes Source/Destination
+    source_candidates = [c for c in df.columns if "source" in c.lower()]
+    dest_candidates = [c for c in df.columns if "dest" in c.lower()]
+
+    if source_candidates:
+        rename_map[source_candidates[0]] = "Source"
+        for i, col in enumerate(source_candidates[1:], start=2):
+            rename_map[col] = f"Source_{i}"
+
+    if dest_candidates:
+        rename_map[dest_candidates[0]] = "Destination"
+        for i, col in enumerate(dest_candidates[1:], start=2):
+            rename_map[col] = f"Destination_{i}"
+
     return df.rename(columns=rename_map)
 
 def parse_euro_number(series):
@@ -108,7 +124,7 @@ if accruals is None:
     st.stop()
 
 # =====================================================
-# CLEANING
+# CLEANING FUNCTIONS
 # =====================================================
 def clean_accruals(df):
     df = safe_rename(df)
