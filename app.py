@@ -2,6 +2,8 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import plotly.express as px
+import base64
+import os
 
 st.set_page_config(layout="wide", page_title="Executive Supply Chain Dashboard")
 
@@ -310,3 +312,16 @@ if "Date" in df.columns:
 # =====================================================
 st.subheader("🔍 Data")
 st.dataframe(df, use_container_width=True)
+
+# =====================================================
+# DOWNLOAD SAFE VERSION OF APP.PY
+# =====================================================
+with open(__file__, "r", encoding="utf-8") as f:
+    app_code = f.read()
+
+st.sidebar.download_button(
+    label="⬇️ Download app.py (safe)",
+    data=app_code,
+    file_name="app.py",
+    mime="text/plain"
+)
