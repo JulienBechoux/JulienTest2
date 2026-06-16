@@ -1,9 +1,60 @@
+# =====================================================
+# AUTO‑CLEAN EDGE METADATA INJECTION
+# =====================================================
+import os, sys
+
+def _clean_edge_injection():
+    """
+    Removes any Edge browser metadata accidentally injected into this file.
+    Prevents crashes like InvalidIndexError during concat.
+    """
+    bad_markers = [
+        "edge_all_open_tabs",
+        "User's Edge browser tabs metadata",
+        "pageTitle",
+        "pageUrl",
+        "tabId",
+        "isCurrent"
+    ]
+
+    try:
+        with open(__file__, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+
+        cleaned = []
+        skipping = False
+
+        for line in lines:
+            if any(marker in line for marker in bad_markers):
+                skipping = True
+                continue
+
+            if skipping:
+                if line.strip().endswith("]") or line.strip().endswith("}"):
+                    skipping = False
+                continue
+
+            cleaned.append(line)
+
+        if len(cleaned) != len(lines):
+            with open(__file__, "w", encoding="utf-8") as f:
+                f.writelines(cleaned)
+            print("⚠️ Edge metadata removed from app.py")
+
+    except Exception:
+        pass
+
+_clean_edge_injection()
+
+# =====================================================
+# REAL APPLICATION STARTS HERE
+# =====================================================
+
 import streamlit as st
 import pandas as pd
 import numpy as np
 import plotly.express as px
 import base64
-import os
 
 st.set_page_config(layout="wide", page_title="Executive Supply Chain Dashboard")
 
@@ -242,6 +293,10 @@ if tm is not None:
     frames.append(tm)
 if erp is not None:
     frames.append(erp)
+
+# FORCE UNIQUE COLUMN NAMES BEFORE CONCAT
+for f in frames:
+    f.columns = pd.io.parsers.ParserBase({'names': f.columns})._maybe_dedup_names(f.columns)
 
 df = pd.concat(frames, ignore_index=True, sort=False)
 
