@@ -1,181 +1,279 @@
-# app.py
-import re
-import logging
-from typing import Dict, Optional
+import streamlit as st
 import pandas as pd
-from pandas import DataFrame
+import numpy as np
+import plotly.express as px
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+st.set_page_config(layout="wide", page_title="Executive Supply Chain Dashboard")
 
-# Expected logical columns and common variants to match against Excel headers
-COLUMN_VARIANTS = {
-    "net_amount": ["net amt in doc crcy", "net amt", "net amount", "net_amt", "net amount in doc crcy"],
-    "currency": ["currency", "curr"],
-    "incoterm": ["incoterm", "inco term"],
-    "carrier": ["carrier", "carrier description"],
-    "source_location": ["source location description", "source location", "source"],
-    "destination_location": ["destination location description", "destination location", "destination"],
-    "purchasing_org": ["purchasing org.", "purchasing org", "purchasing_org"],
-    "company_id": ["company id", "company_id"],
-    "freight_order_type": ["freight order type", "freight order"],
-    "freight_account": ["freight account", "freight_account"],
-    "cost_center": ["cost center", "cost_center"],
-    "actual_delivered_date": ["actual delivered date", "actual delivered", "actual_delivered_date"],
-    "planned_arrival_date": ["planned arrival date-last stop", "planned arrival date", "planned arrival"],
-    "execution_status": ["execution status", "status", "execution_status"],
-    "net_amount_currency": ["net amt in doc crcy currency", "net amt currency"]
-}
+# =====================================================
+# HEADER
+# =====================================================
+st.title("📊 Executive Supply Chain Dashboard")
 
-DATE_REGEX = re.compile(r"(\d{1,2}\.\d{1,2}\.\d{4}\s+\d{1,2}:\d{2}:\d{2})")
+st.markdown("""
+Upload your SAP datasets and analyze cost drivers, carriers, and performance.
+""")
 
-def _normalize_header(h: str) -> str:
-    if pd.isna(h):
-        return ""
-    return re.sub(r"[^0-9a-z]+", " ", str(h).strip().lower())
+# =====================================================
+# UPLOAD
+# =====================================================
+st.sidebar.header("Upload Files")
 
-def _find_column(df: DataFrame, variants: list) -> Optional[str]:
-    headers = {col: _normalize_header(col) for col in df.columns}
-    for col, norm in headers.items():
-        for v in variants:
-            if v in norm:
-                return col
-    # fallback: try exact match on normalized header
-    for col, norm in headers.items():
-        for v in variants:
-            if norm == v:
-                return col
-    return None
+accruals_file = st.sidebar.file_uploader("Manual Accruals", type=["xlsx"])
+tm_file = st.sidebar.file_uploader("SAP TM", type=["xlsx"])
+erp_file = st.sidebar.file_uploader("SAP ERP", type=["xlsx"])
 
-def map_columns(df: DataFrame) -> Dict[str, Optional[str]]:
-    """Return mapping from logical name to actual DataFrame column name (or None)."""
-    mapping = {}
-    for logical, variants in COLUMN_VARIANTS.items():
-        mapping[logical] = _find_column(df, variants)
-    return mapping
+# =====================================================
+# CACHED LOADERS
+# =====================================================
+@st.cache_data
+def load_excel(file):
+    return pd.read_excel(file, engine="openpyxl")
 
-def _extract_datetime_from_string(s: str) -> Optional[pd.Timestamp]:
-    if pd.isna(s):
-        return None
-    s = str(s).strip()
-    # Try to find a dd.mm.yyyy HH:MM:SS pattern
-    m = DATE_REGEX.search(s)
-    if m:
-        dt_str = m.group(1)
-        try:
-            # dayfirst True because format is dd.mm.yyyy
-            return pd.to_datetime(dt_str, dayfirst=True, errors="coerce")
-        except Exception:
-            return None
-    # fallback: try generic parse
-    try:
-        return pd.to_datetime(s, dayfirst=True, errors="coerce")
-    except Exception:
-        return None
+@st.cache_data
+def load_erp(file):
+    df = pd.read_excel(file, engine="openpyxl")
 
-def _to_numeric_amount(x):
-    if pd.isna(x):
-        return None
-    s = str(x).strip()
-    # Remove non-numeric except dot and comma and minus
-    s = re.sub(r"[^\d\-,\.]", "", s)
-    # If comma used as decimal separator and dot as thousands, handle common cases:
-    if s.count(",") == 1 and s.count(".") > 1:
-        # remove dots (thousands), replace comma with dot
-        s = s.replace(".", "").replace(",", ".")
-    elif s.count(",") > 1 and s.count(".") == 1:
-        # remove commas (thousands)
-        s = s.replace(",", "")
-    else:
-        # unify comma to dot if comma looks like decimal separator
-        if s.count(",") == 1 and s.count(".") == 0:
-            s = s.replace(",", ".")
-        else:
-            s = s.replace(",", "")
-    try:
-        return float(s)
-    except Exception:
-        return None
+    # Keep only useful columns
+    keep_cols = [c for c in df.columns if c in ["Material", "Matl Group", "Net value"]]
+    df = df[keep_cols]
 
-def normalize_status(s: str) -> Optional[str]:
-    if pd.isna(s):
-        return None
-    s = str(s).strip().lower()
-    if "executed" in s:
-        return "Executed"
-    if "in execution" in s or "in execution" == s:
-        return "In Execution"
-    return s.title() if s else None
+    # Reduce size if too large
+    if len(df) > 200000:
+        df = df.sample(200000, random_state=42)
 
-def load_and_clean_manual_accruals(path: str, sheet_name=0) -> DataFrame:
-    """
-    Load the updated 'Manual accruals.xlsx' and return a cleaned DataFrame.
-    - path: path to the Excel file
-    - sheet_name: sheet index or name
-    """
-    df = pd.read_excel(path, sheet_name=sheet_name, dtype=object)
-    original_cols = list(df.columns)
-    logger.info("Loaded file with columns: %s", original_cols)
+    return df
 
-    mapping = map_columns(df)
-    logger.info("Column mapping detected: %s", mapping)
+# =====================================================
+# LOAD DATA
+# =====================================================
+accruals = load_excel(accruals_file) if accruals_file else None
+tm = load_excel(tm_file) if tm_file else None
+erp = load_erp(erp_file) if erp_file else None
 
-    # Build cleaned DataFrame with canonical column names
-    cleaned = pd.DataFrame()
-    # Copy mapped columns or create empty columns if missing
-    for logical in COLUMN_VARIANTS.keys():
-        actual = mapping.get(logical)
-        if actual is not None:
-            cleaned[logical] = df[actual]
-        else:
-            cleaned[logical] = pd.NA
-            logger.warning("Missing expected column for '%s' - filled with NA", logical)
+# =====================================================
+# SAFETY
+# =====================================================
+if accruals is None:
+    st.warning("Upload Manual Accruals file to start.")
+    st.stop()
 
-    # Parse dates
-    cleaned["actual_delivered_date_parsed"] = cleaned["actual_delivered_date"].apply(_extract_datetime_from_string)
-    cleaned["planned_arrival_date_parsed"] = cleaned["planned_arrival_date"].apply(_extract_datetime_from_string)
+if tm is None:
+    st.info("SAP TM not uploaded — limited transport metrics")
 
-    # Convert net amount to numeric
-    # Try to find the best net amount column: prefer 'net_amount' logical mapping
-    cleaned["net_amount_value"] = cleaned["net_amount"].apply(_to_numeric_amount)
+if erp is None:
+    st.info("SAP ERP not uploaded — limited product insights")
 
-    # If there is a separate currency column, keep it
-    cleaned["currency"] = cleaned.get("currency", pd.Series([pd.NA]*len(cleaned)))
+# =====================================================
+# CLEANING FUNCTIONS
+# =====================================================
+def safe_rename(df):
+    col_map = {
+        "Net Amt in Doc Crcy": "Cost",
+        "Net value": "NetValue"
+    }
+    return df.rename(columns={k: v for k, v in col_map.items() if k in df.columns})
 
-    # Normalize execution status
-    cleaned["execution_status_normalized"] = cleaned["execution_status"].apply(normalize_status)
+@st.cache_data
+def parse_euro_number(series):
+    return pd.to_numeric(
+        series.astype(str)
+        .str.replace(".", "", regex=False)
+        .str.replace(",", ".", regex=False),
+        errors="coerce"
+    )
 
-    # Trim whitespace for text columns
-    text_cols = ["carrier", "source_location", "destination_location", "purchasing_org", "company_id", "freight_order_type", "freight_account", "cost_center"]
-    for c in text_cols:
-        if c in cleaned.columns:
-            cleaned[c] = cleaned[c].astype(str).replace("nan", pd.NA).apply(lambda x: x.strip() if pd.notna(x) else x)
+# =====================================================
+# PREPARE DATA (CACHED)
+# =====================================================
+@st.cache_data
+def prepare_data(accruals, tm, erp):
 
-    # Reorder columns to a sensible order
-    final_cols = [
-        "net_amount_value", "currency", "incoterm", "carrier",
-        "source_location", "destination_location", "purchasing_org",
-        "company_id", "freight_order_type", "freight_account", "cost_center",
-        "actual_delivered_date_parsed", "planned_arrival_date_parsed",
-        "execution_status_normalized"
+    accruals = safe_rename(accruals)
+
+    # Parse dates once
+    for col in accruals.columns:
+        if "Date" in col:
+            accruals[col] = pd.to_datetime(accruals[col], errors="coerce")
+
+    # TM processing
+    if tm is not None:
+        tm = safe_rename(tm)
+
+        if "Gross Weight" in tm.columns:
+            tm["Gross Weight"] = parse_euro_number(tm["Gross Weight"])
+
+        if "Cost" in tm.columns and "Gross Weight" in tm.columns:
+            tm["Cost_per_kg"] = tm["Cost"] / tm["Gross Weight"].replace(0, np.nan)
+
+    # ERP rename
+    if erp is not None:
+        erp = safe_rename(erp)
+
+    return accruals, tm, erp
+
+accruals, tm, erp = prepare_data(accruals, tm, erp)
+
+# =====================================================
+# FILTERS
+# =====================================================
+st.sidebar.header("Filters")
+
+status_filter = []
+if "Execution Status" in accruals.columns:
+    status_filter = st.sidebar.multiselect(
+        "Status",
+        accruals["Execution Status"].dropna().unique(),
+        default=accruals["Execution Status"].dropna().unique()
+    )
+
+date_range = None
+if "Actual Delivered Date" in accruals.columns:
+    date_range = st.sidebar.date_input(
+        "Date Range",
+        [accruals["Actual Delivered Date"].min(),
+         accruals["Actual Delivered Date"].max()]
+    )
+
+df = accruals.copy()
+
+if status_filter and "Execution Status" in df.columns:
+    df = df[df["Execution Status"].isin(status_filter)]
+
+if date_range and "Actual Delivered Date" in df.columns:
+    df = df[
+        (df["Actual Delivered Date"] >= pd.to_datetime(date_range[0])) &
+        (df["Actual Delivered Date"] <= pd.to_datetime(date_range[1]))
     ]
-    # Keep only those that exist
-    final_cols = [c for c in final_cols if c in cleaned.columns]
-    cleaned = cleaned[final_cols]
 
-    # Final housekeeping: set dtypes
-    if "net_amount_value" in cleaned.columns:
-        cleaned["net_amount_value"] = pd.to_numeric(cleaned["net_amount_value"], errors="coerce")
+# =====================================================
+# PRE-AGGREGATIONS (CACHED)
+# =====================================================
+@st.cache_data
+def compute_aggregations(df):
 
-    logger.info("Cleaning complete. Resulting columns: %s", list(cleaned.columns))
-    return cleaned
+    results = {}
 
-# Example usage when integrating into your app:
-if __name__ == "__main__":
-    import sys
-    if len(sys.argv) < 2:
-        print("Usage: python app.py <path_to_manual_accruals.xlsx>")
-        sys.exit(1)
-    path = sys.argv[1]
-    df_clean = load_and_clean_manual_accruals(path)
-    print(df_clean.head(10).to_string(index=False))
+    if "Carrier Description" in df.columns:
+        carrier = df.groupby("Carrier Description")["Cost"].agg(["sum", "count"])
+        carrier["cost_per_shipment"] = carrier["sum"] / carrier["count"]
+        results["carrier"] = carrier.sort_values("sum", ascending=False).head(10)
+
+    if "Actual Delivered Date" in df.columns:
+        time = df.groupby(pd.Grouper(key="Actual Delivered Date", freq="W"))["Cost"].sum()
+        results["time"] = time
+
+    if "Carrier Description" in df.columns:
+        total_cost = df.groupby("Carrier Description")["Cost"].sum()
+        results["top_carrier"] = total_cost.idxmax()
+        results["top_cost"] = total_cost.max()
+
+    return results
+
+agg = compute_aggregations(df)
+
+# =====================================================
+# KPIs
+# =====================================================
+total_cost = df["Cost"].sum() if "Cost" in df.columns else 0
+shipments = len(df)
+avg_cost = df["Cost"].mean() if "Cost" in df.columns else 0
+
+exec_rate = 0
+if "Execution Status" in df.columns:
+    exec_rate = (df["Execution Status"] == "Executed").mean()
+
+avg_cost_per_kg = tm["Cost_per_kg"].mean() if tm is not None and "Cost_per_kg" in tm else 0
+
+col1, col2, col3, col4, col5 = st.columns(5)
+
+col1.metric("Total Cost", f"€{total_cost:,.0f}")
+col2.metric("Shipments", f"{shipments:,}")
+col3.metric("Avg Cost", f"€{avg_cost:,.0f}")
+col4.metric("Execution Rate", f"{exec_rate*100:.1f}%")
+col5.metric("Avg €/kg", f"{avg_cost_per_kg:.2f}")
+
+# =====================================================
+# COST DRIVERS
+# =====================================================
+st.subheader("💸 Cost Drivers")
+
+if "carrier" in agg:
+    fig = px.bar(
+        agg["carrier"],
+        x=agg["carrier"].index,
+        y="sum"
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+# =====================================================
+# NETWORK
+# =====================================================
+if "Source Location Description" in df.columns and "Destination Location Descripti" in df.columns:
+
+    st.subheader("🌍 Top Routes")
+
+    df["Route"] = df["Source Location Description"] + " → " + df["Destination Location Descripti"]
+    route_df = df.groupby("Route")["Cost"].sum().sort_values(ascending=False).head(15)
+
+    fig = px.bar(route_df, orientation="h")
+    st.plotly_chart(fig, use_container_width=True)
+
+# =====================================================
+# CARRIER PERFORMANCE
+# =====================================================
+if "carrier" in agg:
+    st.subheader("🚚 Carrier Performance")
+
+    fig = px.scatter(
+        agg["carrier"],
+        x="count",
+        y="cost_per_shipment",
+        size="sum",
+        hover_name=agg["carrier"].index
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+# =====================================================
+# ERP ANALYSIS
+# =====================================================
+if erp is not None and "NetValue" in erp.columns:
+
+    st.subheader("📦 Product Value")
+
+    group_col = st.selectbox("Group by", [c for c in ["Matl Group", "Material"] if c in erp.columns])
+
+    erp_group = erp.groupby(group_col)["NetValue"].sum().nlargest(10)
+
+    fig = px.bar(erp_group)
+    st.plotly_chart(fig, use_container_width=True)
+
+# =====================================================
+# SIMULATOR
+# =====================================================
+if "top_cost" in agg:
+    st.subheader("🧮 Cost Optimization")
+
+    reduction = st.slider("Reduce top carrier cost (%)", 0, 30, 10)
+
+    savings = agg["top_cost"] * reduction / 100
+
+    st.metric("Estimated Savings", f"€{savings:,.0f}")
+    st.info(f"Top carrier: {agg['top_carrier']}")
+
+# =====================================================
+# TREND
+# =====================================================
+if "time" in agg:
+    st.subheader("📈 Cost Trend")
+    fig = px.line(agg["time"])
+    st.plotly_chart(fig, use_container_width=True)
+
+# =====================================================
+# DATA TABLE
+# =====================================================
+st.subheader("🔍 Data")
+st.dataframe(df, use_container_width=True)
+
+
+
