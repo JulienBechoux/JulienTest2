@@ -1,3 +1,4 @@
+# app.py
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -35,7 +36,7 @@ def load_erp(file):
     # Read full sheet (first sheet by default)
     df = pd.read_excel(file, engine="openpyxl")
 
-    # Keep only useful columns if present
+    # Keep only useful columns if present (including the ERP-specific ones)
     keep_candidates = [
         "Material", "Matl Group", "Net value",
         "Loc.curr.amount", "Local Curr.", "Loc curr amount", "Local Curr"
@@ -90,13 +91,12 @@ def safe_rename(df):
         "Loc.curr.amount": "NetValue",
         "Loc.curr.amount ": "NetValue",
         "Loc curr amount": "NetValue",
-        "Loc.curr.amount.": "NetValue",
         "Local Curr.": "Currency",
         "Local Curr": "Currency",
-        "Local Curr. ": "Currency",
-        "Local Curr .": "Currency",
-        # Generic
+        # Generic variants
         "Net value ": "NetValue",
+        "Net Value": "NetValue",
+        "Loc.curr.amount.": "NetValue",
     }
     # Only rename columns that exist
     rename_map = {k: v for k, v in col_map.items() if k in df.columns}
@@ -106,24 +106,22 @@ def safe_rename(df):
 def parse_euro_number(series):
     """
     Convert numbers that may use '.' as thousand separator and ',' as decimal separator
-    into float. Also handles plain numeric strings.
+    into float. Also handles plain numeric strings. If input is None, returns a Series of NaN.
     """
     if series is None:
-        return series
+        return pd.Series(dtype=float)
     s = series.astype(str).fillna("").str.strip()
-    # Remove currency symbols and spaces
     s = s.str.replace(r"[^\d\-,\.]", "", regex=True)
-    # Heuristic conversions:
-    # If there are both '.' and ',' and '.' appears before ',' -> '.' thousands, ',' decimal
+
     def _convert(val):
-        if val is None or val == "" or val.lower() == "nan":
+        if val is None:
             return np.nan
-        v = str(val)
-        # remove leading/trailing whitespace
-        v = v.strip()
-        # if both separators present
+        v = str(val).strip()
+        if v == "" or v.lower() == "nan":
+            return np.nan
+        # both separators present
         if v.count(".") > 0 and v.count(",") > 0:
-            # assume dot thousands, comma decimal if last comma is after last dot
+            # assume dot thousands, comma decimal if last comma after last dot
             if v.rfind(",") > v.rfind("."):
                 v = v.replace(".", "").replace(",", ".")
             else:
@@ -133,12 +131,12 @@ def parse_euro_number(series):
             if v.count(",") == 1 and v.count(".") == 0:
                 v = v.replace(",", ".")
             else:
-                # remove any thousands separators (commas)
                 v = v.replace(",", "")
         try:
             return float(v)
         except Exception:
             return np.nan
+
     return series.apply(_convert)
 
 # =====================================================
@@ -163,7 +161,7 @@ def prepare_data(accruals, tm, erp):
         accruals["Cost"] = parse_euro_number(accruals["Cost"])
     else:
         # try other likely columns
-        possible_amounts = [c for c in accruals.columns if "amt" in c.lower() or "amount" in c.lower() or "net" in c.lower()]
+        possible_amounts = [c for c in accruals.columns if "amt" in c.lower() or "amount" in c.lower() or "net" in c.lower() or "value" in c.lower()]
         if possible_amounts:
             accruals["Cost"] = parse_euro_number(accruals[possible_amounts[0]])
         else:
@@ -177,18 +175,16 @@ def prepare_data(accruals, tm, erp):
         if "Cost" in tm.columns:
             tm["Cost"] = parse_euro_number(tm["Cost"])
         else:
-            # fallback: try to find a numeric-like column
-            possible_amounts = [c for c in tm.columns if "amt" in c.lower() or "amount" in c.lower() or "net" in c.lower()]
+            possible_amounts = [c for c in tm.columns if "amt" in c.lower() or "amount" in c.lower() or "net" in c.lower() or "value" in c.lower()]
             if possible_amounts:
                 tm["Cost"] = parse_euro_number(tm[possible_amounts[0]])
             else:
                 tm["Cost"] = np.nan
 
-        # TM currency column is typically 'Currency' (per your note)
+        # TM currency column is 'Currency' per your note
         if "Currency" in tm.columns:
             tm["Currency"] = tm["Currency"].astype(str).str.strip()
         else:
-            # try common variants
             possible_curr = [c for c in tm.columns if "curr" in c.lower() or "currency" in c.lower()]
             if possible_curr:
                 tm["Currency"] = tm[possible_curr[0]].astype(str).str.strip()
@@ -213,8 +209,7 @@ def prepare_data(accruals, tm, erp):
         if "NetValue" in erp.columns:
             erp["NetValue"] = parse_euro_number(erp["NetValue"])
         else:
-            # fallback: try to find a numeric-like column
-            possible_amounts = [c for c in erp.columns if "loc" in c.lower() and "amt" in c.lower() or "amount" in c.lower() or "net" in c.lower()]
+            possible_amounts = [c for c in erp.columns if ("loc" in c.lower() and ("amt" in c.lower() or "amount" in c.lower())) or "net" in c.lower() or "value" in c.lower()]
             if possible_amounts:
                 erp["NetValue"] = parse_euro_number(erp[possible_amounts[0]])
             else:
@@ -283,7 +278,7 @@ if date_range and date_col in df.columns:
 # PRE-AGGREGATIONS (CACHED)
 # =====================================================
 @st.cache_data
-def compute_aggregations(df):
+def compute_aggregations(df, date_col_name=None):
 
     results = {}
 
@@ -292,9 +287,9 @@ def compute_aggregations(df):
         carrier["cost_per_shipment"] = carrier["sum"] / carrier["count"]
         results["carrier"] = carrier.sort_values("sum", ascending=False).head(10)
 
-    # Use the date_col if present
-    if date_col in df.columns:
-        time = df.groupby(pd.Grouper(key=date_col, freq="W"))["Cost"].sum()
+    # Use the provided date_col_name if present
+    if date_col_name and date_col_name in df.columns:
+        time = df.groupby(pd.Grouper(key=date_col_name, freq="W"))["Cost"].sum()
         results["time"] = time
 
     if "Carrier Description" in df.columns:
@@ -305,7 +300,7 @@ def compute_aggregations(df):
 
     return results
 
-agg = compute_aggregations(df)
+agg = compute_aggregations(df, date_col_name=date_col)
 
 # =====================================================
 # KPIs
