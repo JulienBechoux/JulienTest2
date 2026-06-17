@@ -1,395 +1,505 @@
-import streamlit as st
-import pandas as pd
+# app.py
+import io
+from datetime import datetime
+
 import numpy as np
-
-# -----------------------------
-# Helpers
-# -----------------------------
-
-def safe_parse_date(series: pd.Series) -> pd.Series:
-    return pd.to_datetime(series, errors="coerce")
+import pandas as pd
+import plotly.express as px
+import streamlit as st
 
 
-def clean_carrier_manual(carrier: pd.Series) -> pd.Series:
-    # Remove " as of ..." and everything after
-    return carrier.astype(str).str.split(" as of", n=1).str[0].str.strip()
+# ------------- Helpers -------------------------------------------------
 
 
-def load_excel(file, sheet_name=None):
-    if file is None:
-        return None
-    return pd.read_excel(file, sheet_name=sheet_name)
+def _clean_column_names(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    df.columns = (
+        df.columns.astype(str)
+        .str.strip()
+        .str.replace("\n", " ", regex=False)
+        .str.replace("\r", " ", regex=False)
+    )
+    return df
 
 
-# -----------------------------
-# Transformations
-# -----------------------------
+def _parse_date(series, dayfirst=True):
+    return pd.to_datetime(series, errors="coerce", dayfirst=dayfirst)
+
+
+def _strip_after_slash(text: str) -> str:
+    if pd.isna(text):
+        return text
+    return str(text).split(" /")[0]
+
+
+# ------------- Transformations ----------------------------------------
+
 
 def transform_manual_accruals(df: pd.DataFrame) -> pd.DataFrame:
-    out = df.copy()
+    df = _clean_column_names(df)
 
-    # Mapping
-    out["Carrier"] = clean_carrier_manual(out["Carrier Description"])
-    out["Type of goods"] = out["PBU"]
-    out["Date"] = safe_parse_date(out["Planned Arrival Date-Last Stop"])
-    out["Origin"] = out["Source Location Description"]
-    out["Destination"] = out["Destination Location Descripti"]
-    out["Value"] = pd.to_numeric(out["Net Amt in Doc Crcy"], errors="coerce")
-    out["Currency"] = out["Currency"]
-    out["Source System"] = "Manual accruals"
+    # Column names as seen in the sample
+    col_doc = "Document"
+    col_value = "Net Amt in Doc Crcy"
+    col_curr = "Currency"
+    col_carrier_desc = "Carrier Description"
+    col_pbu = "PBU"
+    col_date = "Planned Arrival Date-Last Stop"
+    col_origin = "Source Location Description"
+    col_dest = "Destination Location Descripti"
 
-    return out[[
-        "Date", "Carrier", "Type of goods", "Origin",
-        "Destination", "Value", "Currency", "Source System"
-    ]]
+    # Basic safety
+    for c in [
+        col_doc,
+        col_value,
+        col_curr,
+        col_carrier_desc,
+        col_pbu,
+        col_date,
+        col_origin,
+        col_dest,
+    ]:
+        if c not in df.columns:
+            st.warning(f"[Manual accruals] Expected column '{c}' not found.")
+    # Carrier
+    df["Carrier"] = df[col_carrier_desc].apply(_strip_after_slash)
 
+    # Type of goods
+    df["Type of goods"] = df[col_pbu].fillna("Unknown")
 
-def map_product_hierarchy_to_type(h: pd.Series) -> pd.Series:
-    h = h.astype(str).str.strip()
-    # Starts with 1 or 4 => FG, else NFG
-    return np.where(h.str.startswith(("1", "4")), "FG", "NFG")
+    # Date
+    df["Date"] = _parse_date(df[col_date])
+
+    # Origin / Destination
+    df["Origin"] = df[col_origin]
+    df["Destination"] = df[col_dest]
+
+    # Value / Currency
+    df["Value"] = pd.to_numeric(df[col_value], errors="coerce")
+    df["Currency"] = df[col_curr]
+
+    df["Source System"] = "Manual Accruals"
+
+    return df[
+        [
+            "Source System",
+            "Carrier",
+            "Type of goods",
+            "Date",
+            "Origin",
+            "Destination",
+            "Value",
+            "Currency",
+        ]
+    ].dropna(subset=["Date", "Carrier", "Origin", "Destination", "Value"])
 
 
 def transform_sap_erp(
-    erp_df: pd.DataFrame,
-    carrier_name_df: pd.DataFrame,
-    shipping_point_df: pd.DataFrame,
-    customers_df: pd.DataFrame,
-    plants_df: pd.DataFrame,
+    df_erp: pd.DataFrame,
+    df_carrier: pd.DataFrame,
+    df_shippt: pd.DataFrame,
+    df_plants: pd.DataFrame,
+    df_customers: pd.DataFrame,
 ) -> pd.DataFrame:
-    df = erp_df.copy()
+    df_erp = _clean_column_names(df_erp)
+    df_carrier = _clean_column_names(df_carrier)
+    df_shippt = _clean_column_names(df_shippt)
+    df_plants = _clean_column_names(df_plants)
+    df_customers = _clean_column_names(df_customers)
 
-    # Carrier: ServcAgent -> ERP Carrier Name.Name 1
-    carrier_map = carrier_name_df.set_index("ServcAgent")["Name 1"]
-    df["Carrier"] = df["ServcAgent"].map(carrier_map)
+    # Expected columns (SAP ERP)
+    col_servcagent = "ServcAgent"
+    col_prod_hier = "Product Hierarchy"
+    col_date = "Deliv.Date"
+    col_shpt = "ShPt"
+    col_shipto = "Ship-To"
+    col_plnt = "Plnt"
+    col_value = "Loc.curr.amount"
+    col_curr = "Local Curr."
 
-    # Type of goods: Product Hierarchy
-    df["Type of goods"] = map_product_hierarchy_to_type(df["Product Hierarchy"])
+    for c in [
+        col_servcagent,
+        col_prod_hier,
+        col_date,
+        col_shpt,
+        col_shipto,
+        col_plnt,
+        col_value,
+        col_curr,
+    ]:
+        if c not in df_erp.columns:
+            st.warning(f"[SAP ERP] Expected column '{c}' not found.")
+
+    # Carrier mapping
+    # ERP Carrier Name: first column is supplier number, second is Name 1
+    carrier_key = df_carrier.columns[0]
+    carrier_name = df_carrier.columns[1]
+    carrier_map = df_carrier.set_index(carrier_key)[carrier_name]
+
+    df_erp["Carrier"] = df_erp[col_servcagent].map(carrier_map).fillna(
+        df_erp[col_servcagent].astype(str)
+    )
+
+    # Type of goods from Product Hierarchy
+    def classify_type(ph):
+        ph = str(ph) if not pd.isna(ph) else ""
+        if ph.startswith("1") or ph.startswith("4"):
+            return "FG"
+        return "NFG"
+
+    df_erp["Type of goods"] = df_erp[col_prod_hier].apply(classify_type)
 
     # Date
-    df["Date"] = safe_parse_date(df["Deliv.Date"])
+    df_erp["Date"] = _parse_date(df_erp[col_date])
 
-    # Origin: ShPt -> ERP Shipping Point.Description, if empty => "Import"
-    shp_map = shipping_point_df.set_index("ShPt")["Description"]
-    df["Origin"] = df["ShPt"].map(shp_map)
-    df.loc[df["ShPt"].isna() | (df["ShPt"] == ""), "Origin"] = "Import"
-
-    # Destination:
-    # If Ship-To not empty: Ship-To -> ERP Customers.Name 1
-    # Else: Plnt -> ERP Plants.Name 1
-    cust_map = customers_df.set_index("Ship-To")["Name 1"]
-    plant_map = plants_df.set_index("Plnt")["Name 1"]
-
-    df["Destination"] = df["Ship-To"].map(cust_map)
-    mask_empty_shipto = df["Ship-To"].isna() | (df["Ship-To"] == "")
-    df.loc[mask_empty_shipto, "Destination"] = df.loc[mask_empty_shipto, "Plnt"].map(plant_map)
-
-    # Value & Currency
-    df["Value"] = pd.to_numeric(df["Loc.curr.amount"], errors="coerce")
-    df["Currency"] = df["Local Curr."]
-
-    df["Source System"] = "SAP ERP"
-
-    return df[[
-        "Date", "Carrier", "Type of goods", "Origin",
-        "Destination", "Value", "Currency", "Source System"
-    ]]
-
-
-def transform_sap_tm(tm_df: pd.DataFrame, fo_df: pd.DataFrame, fb_df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Rules:
-    - Use Freight Document in SAP TM as reference.
-    - Freight Document starting with '69' => look up in TM FB.
-    - Freight Document starting with '68' => look up in TM FO.
-    - Carrier comes from FO/FB 'Carrier' column (NOT from TM 'Invoicing Party').
-    - FB:
-        Date = Expected Arrival Date
-        Origin = Source Location Description
-        Destination = Destination Location Descripti
-    - FO:
-        Date = Actual Delivered Date
-        If empty => Planned Arrival Date-Last Stop
-        Origin = Source Location Description
-        Destination = Destination Location Descripti
-    """
-
-    tm = tm_df.copy()
-    tm["Freight Document"] = tm["Freight Document"].astype(str)
-
-    # ----------------- FO reference -----------------
-    fo = fo_df.copy()
-    if "Document" in fo.columns:
-        fo["Document"] = fo["Document"].astype(str)
+    # Origin from Shipping Point
+    shippt_key = "ShPt"
+    shippt_desc = "Description"
+    if shippt_key not in df_shippt.columns or shippt_desc not in df_shippt.columns:
+        st.warning("[ERP Shipping Point] Expected columns not found.")
+        shippt_map = {}
     else:
-        fo["Document"] = fo["Freight Document"].astype(str) if "Freight Document" in fo.columns else ""
+        shippt_map = df_shippt.set_index(shippt_key)[shippt_desc]
 
-    # Date logic for FO
-    fo["Date"] = pd.NaT
-    if "Actual Delivered Date" in fo.columns:
-        fo["Date"] = safe_parse_date(fo["Actual Delivered Date"])
+    df_erp["Origin"] = df_erp[col_shpt].map(shippt_map)
+    df_erp.loc[df_erp[col_shpt].isna() | (df_erp[col_shpt] == ""), "Origin"] = "Import"
 
-    if "Planned Arrival Date-Last Stop" in fo.columns:
-        planned = safe_parse_date(fo["Planned Arrival Date-Last Stop"])
-        fo["Date"] = fo["Date"].fillna(planned)
-
-    fo["Origin"] = fo.get("Source Location Description")
-    fo["Destination"] = fo.get("Destination Location Descripti")
-
-    # Carrier from FO file
-    if "Carrier" in fo.columns:
-        fo["Carrier_ref"] = fo["Carrier"]
+    # Destination mapping
+    cust_key = df_customers.columns[0] if len(df_customers.columns) > 1 else None
+    cust_name = df_customers.columns[1] if len(df_customers.columns) > 1 else None
+    if cust_key and cust_name:
+        cust_map = df_customers.set_index(cust_key)[cust_name]
     else:
-        fo["Carrier_ref"] = np.nan
+        cust_map = {}
 
-    fo_ref_cols = ["Document", "Date", "Origin", "Destination", "Carrier_ref"]
-    fo_ref = fo[fo_ref_cols].drop_duplicates(subset=["Document"])
-
-    # ----------------- FB reference -----------------
-    fb = fb_df.copy()
-    if "Document" in fb.columns:
-        fb["Document"] = fb["Document"].astype(str)
+    plant_key = "Plnt"
+    plant_name = "Name 1"
+    if plant_key not in df_plants.columns or plant_name not in df_plants.columns:
+        st.warning("[ERP Plants] Expected columns not found.")
+        plant_map = {}
     else:
-        fb["Document"] = fb["Freight Document"].astype(str) if "Freight Document" in fb.columns else ""
+        plant_map = df_plants.set_index(plant_key)[plant_name]
 
-    fb["Date"] = pd.NaT
-    if "Expected Arrival Date" in fb.columns:
-        fb["Date"] = safe_parse_date(fb["Expected Arrival Date"])
+    df_erp["Destination"] = df_erp[col_shipto].map(cust_map)
 
-    fb["Origin"] = fb.get("Source Location Description")
-    fb["Destination"] = fb.get("Destination Location Descripti")
+    # If Ship-To empty, use Plant
+    mask_empty_shipto = df_erp[col_shipto].isna() | (df_erp[col_shipto] == "")
+    df_erp.loc[mask_empty_shipto, "Destination"] = df_erp.loc[
+        mask_empty_shipto, col_plnt
+    ].map(plant_map)
 
-    # Carrier from FB file
-    if "Carrier" in fb.columns:
-        fb["Carrier_ref"] = fb["Carrier"]
-    else:
-        fb["Carrier_ref"] = np.nan
+    # Value / Currency
+    df_erp["Value"] = pd.to_numeric(df_erp[col_value], errors="coerce")
+    df_erp["Currency"] = df_erp[col_curr]
 
-    fb_ref_cols = ["Document", "Date", "Origin", "Destination", "Carrier_ref"]
-    fb_ref = fb[fb_ref_cols].drop_duplicates(subset=["Document"])
+    df_erp["Source System"] = "SAP ERP"
 
-    # ----------------- Merge logic by prefix -----------------
-    # Freight Document starting with 69 -> FB
-    # Freight Document starting with 68 -> FO
-    tm["FD_prefix"] = tm["Freight Document"].str[:2]
+    return df_erp[
+        [
+            "Source System",
+            "Carrier",
+            "Type of goods",
+            "Date",
+            "Origin",
+            "Destination",
+            "Value",
+            "Currency",
+        ]
+    ].dropna(subset=["Date", "Carrier", "Origin", "Destination", "Value"])
 
-    tm_fb = tm[tm["FD_prefix"] == "69"].merge(
-        fb_ref,
-        left_on="Freight Document",
-        right_on="Document",
-        how="left",
-        suffixes=("", "_fb"),
+
+def transform_sap_tm(df_tm: pd.DataFrame, df_fo: pd.DataFrame, df_fb: pd.DataFrame):
+    df_tm = _clean_column_names(df_tm)
+    df_fo = _clean_column_names(df_fo)
+    df_fb = _clean_column_names(df_fb)
+
+    # Expected columns
+    col_fd = "Freight Document"
+    col_invoicing = "Invoicing Party"
+    col_value = "Net Amt in Doc Crcy"
+    col_curr = "Currency"
+
+    for c in [col_fd, col_invoicing, col_value, col_curr]:
+        if c not in df_tm.columns:
+            st.warning(f"[SAP TM] Expected column '{c}' not found.")
+
+    # FO / FB expected columns
+    col_doc_fo = "Freight Document"
+    col_doc_fb = "Freight Document"
+    col_act_deliv = "Actual Delivered Date"
+    col_plan_arr = "Planned Arrival Date-Last Stop"
+    col_exp_arr = "Expected Arrival Date"
+    col_origin = "Source Location Description"
+    col_dest = "Destination Location Descripti"
+
+    for c in [col_doc_fo, col_act_deliv, col_plan_arr, col_origin, col_dest]:
+        if c not in df_fo.columns:
+            st.warning(f"[TM FO] Expected column '{c}' not found.")
+
+    for c in [col_doc_fb, col_exp_arr, col_origin, col_dest]:
+        if c not in df_fb.columns:
+            st.warning(f"[TM FB] Expected column '{c}' not found.")
+
+    df_tm["FD_str"] = df_tm[col_fd].astype(str)
+
+    # 68... -> FO
+    tm_68 = df_tm[df_tm["FD_str"].str.startswith("68")].copy()
+    tm_69 = df_tm[df_tm["FD_str"].str.startswith("69")].copy()
+
+    # Merge with FO
+    df_fo_ren = df_fo.rename(columns={col_doc_fo: col_fd})
+    merged_68 = tm_68.merge(df_fo_ren, on=col_fd, how="left", suffixes=("", "_FO"))
+
+    # Date: Actual Delivered Date if not empty, else Planned Arrival Date-Last Stop
+    merged_68["Date"] = _parse_date(merged_68[col_act_deliv])
+    mask_empty_date = merged_68["Date"].isna()
+    merged_68.loc[mask_empty_date, "Date"] = _parse_date(
+        merged_68.loc[mask_empty_date, col_plan_arr]
     )
 
-    tm_fo = tm[tm["FD_prefix"] == "68"].merge(
-        fo_ref,
-        left_on="Freight Document",
-        right_on="Document",
-        how="left",
-        suffixes=("", "_fo"),
+    merged_68["Origin"] = merged_68[col_origin]
+    merged_68["Destination"] = merged_68[col_dest]
+
+    # Merge with FB
+    df_fb_ren = df_fb.rename(columns={col_doc_fb: col_fd})
+    merged_69 = tm_69.merge(df_fb_ren, on=col_fd, how="left", suffixes=("", "_FB"))
+
+    merged_69["Date"] = _parse_date(merged_69[col_exp_arr])
+    merged_69["Origin"] = merged_69[col_origin]
+    merged_69["Destination"] = merged_69[col_dest]
+
+    df_all = pd.concat([merged_68, merged_69], ignore_index=True)
+
+    df_all["Carrier"] = df_all[col_invoicing]
+    df_all["Type of goods"] = "Unknown"  # not available in TM
+
+    df_all["Value"] = pd.to_numeric(df_all[col_value], errors="coerce")
+    df_all["Currency"] = df_all[col_curr]
+
+    df_all["Source System"] = "SAP TM"
+
+    return df_all[
+        [
+            "Source System",
+            "Carrier",
+            "Type of goods",
+            "Date",
+            "Origin",
+            "Destination",
+            "Value",
+            "Currency",
+        ]
+    ].dropna(subset=["Date", "Carrier", "Origin", "Destination", "Value"])
+
+
+# ------------- Dashboard ----------------------------------------------
+
+
+def build_dashboard(df_all: pd.DataFrame):
+    st.sidebar.header("Filters")
+
+    min_date = df_all["Date"].min()
+    max_date = df_all["Date"].max()
+
+    date_range = st.sidebar.date_input(
+        "Date range",
+        value=(min_date.date() if pd.notna(min_date) else datetime.today().date(),
+               max_date.date() if pd.notna(max_date) else datetime.today().date()),
     )
 
-    # Combine back
-    tm_merged = pd.concat([tm_fb, tm_fo], ignore_index=True)
+    if isinstance(date_range, tuple):
+        start_date, end_date = date_range
+    else:
+        start_date, end_date = date_range, date_range
 
-    # Final fields
-    tm_merged["Date"] = tm_merged["Date"]
-    tm_merged["Origin"] = tm_merged["Origin"]
-    tm_merged["Destination"] = tm_merged["Destination"]
+    mask_date = (df_all["Date"].dt.date >= start_date) & (
+        df_all["Date"].dt.date <= end_date
+    )
 
-    # Carrier must come from FO/FB Carrier_ref
-    tm_merged["Carrier"] = tm_merged["Carrier_ref"]
+    carriers = sorted(df_all["Carrier"].dropna().unique())
+    carrier_sel = st.sidebar.multiselect("Carrier", carriers, default=carriers)
 
-    tm_merged["Value"] = pd.to_numeric(tm_merged["Net Amt in Doc Crcy"], errors="coerce")
-    tm_merged["Currency"] = tm_merged["Currency"]
-    tm_merged["Type of goods"] = "Unknown"
-    tm_merged["Source System"] = "SAP TM"
+    types = sorted(df_all["Type of goods"].dropna().unique())
+    type_sel = st.sidebar.multiselect("Type of goods", types, default=types)
 
-    return tm_merged[[
-        "Date", "Carrier", "Type of goods", "Origin",
-        "Destination", "Value", "Currency", "Source System"
-    ]]
+    origins = sorted(df_all["Origin"].dropna().unique())
+    origin_sel = st.sidebar.multiselect("Origin", origins, default=origins)
+
+    dests = sorted(df_all["Destination"].dropna().unique())
+    dest_sel = st.sidebar.multiselect("Destination", dests, default=dests)
+
+    systems = sorted(df_all["Source System"].dropna().unique())
+    system_sel = st.sidebar.multiselect("Source system", systems, default=systems)
+
+    df_f = df_all[
+        mask_date
+        & df_all["Carrier"].isin(carrier_sel)
+        & df_all["Type of goods"].isin(type_sel)
+        & df_all["Origin"].isin(origin_sel)
+        & df_all["Destination"].isin(dest_sel)
+        & df_all["Source System"].isin(system_sel)
+    ].copy()
+
+    st.markdown("## Freight cost overview")
+
+    if df_f.empty:
+        st.info("No data for the selected filters.")
+        return
+
+    # KPI
+    total_cost = df_f["Value"].sum()
+    st.metric("Total freight cost (all currencies)", f"{total_cost:,.2f}")
+
+    # Cost over time
+    df_time = (
+        df_f.groupby(df_f["Date"].dt.date)["Value"].sum().reset_index(name="Total Cost")
+    )
+    fig_time = px.line(df_time, x="Date", y="Total Cost", title="Cost over time")
+    st.plotly_chart(fig_time, use_container_width=True)
+
+    # Cost by carrier
+    df_carrier = (
+        df_f.groupby("Carrier")["Value"].sum().reset_index(name="Total Cost")
+    ).sort_values("Total Cost", ascending=False)
+    fig_carrier = px.bar(
+        df_carrier.head(20),
+        x="Carrier",
+        y="Total Cost",
+        title="Top carriers by cost",
+    )
+    fig_carrier.update_layout(xaxis_tickangle=-45)
+    st.plotly_chart(fig_carrier, use_container_width=True)
+
+    # Cost by lane (Origin–Destination)
+    df_lane = (
+        df_f.groupby(["Origin", "Destination"])["Value"]
+        .sum()
+        .reset_index(name="Total Cost")
+        .sort_values("Total Cost", ascending=False)
+    )
+    df_lane["Lane"] = df_lane["Origin"] + " → " + df_lane["Destination"]
+    fig_lane = px.bar(
+        df_lane.head(20),
+        x="Lane",
+        y="Total Cost",
+        title="Top lanes by cost",
+    )
+    fig_lane.update_layout(xaxis_tickangle=-45)
+    st.plotly_chart(fig_lane, use_container_width=True)
+
+    # Raw data
+    st.markdown("## Detailed records")
+    st.dataframe(df_f.sort_values("Date", ascending=False))
 
 
-# -----------------------------
-# Streamlit UI
-# -----------------------------
-
-st.set_page_config(page_title="Freight Cost Dashboard", layout="wide")
-
-st.title("📦 Freight Cost Dashboard")
-
-st.markdown(
-    "Upload the three cost sources and reference master data to see consolidated freight costs, "
-    "filter by period, and slice & dice by carrier, type of goods, origin, and destination."
-)
-
-with st.sidebar:
-    st.header("📁 Upload files")
-
-    st.subheader("Manual accruals")
-    file_manual = st.file_uploader("Manual accruals file", type=["xlsx", "xls"], key="manual")
-
-    st.subheader("SAP ERP")
-    file_erp = st.file_uploader("SAP ERP file", type=["xlsx", "xls"], key="erp")
-    file_erp_carrier = st.file_uploader("ERP Carrier Name file", type=["xlsx", "xls"], key="erp_carrier")
-    file_erp_shpt = st.file_uploader("ERP Shipping Point file", type=["xlsx", "xls"], key="erp_shpt")
-    file_erp_customers = st.file_uploader("ERP Customers file", type=["xlsx", "xls"], key="erp_customers")
-    file_erp_plants = st.file_uploader("ERP Plants file", type=["xlsx", "xls"], key="erp_plants")
-
-    st.subheader("SAP TM")
-    file_tm = st.file_uploader("SAP TM file", type=["xlsx", "xls"], key="tm")
-    file_tm_fo = st.file_uploader("TM FO file", type=["xlsx", "xls"], key="tm_fo")
-    file_tm_fb = st.file_uploader("TM FB file", type=["xlsx", "xls"], key="tm_fb")
-
-    st.markdown("---")
-    st.subheader("Date filter")
-    date_from = st.date_input("From", value=None)
-    date_to = st.date_input("To", value=None)
+# ------------- Streamlit UI -------------------------------------------
 
 
 def main():
-    # Load all dataframes
-    df_manual = load_excel(file_manual)
-    df_erp = load_excel(file_erp)
-    df_erp_carrier = load_excel(file_erp_carrier)
-    df_erp_shpt = load_excel(file_erp_shpt)
-    df_erp_customers = load_excel(file_erp_customers)
-    df_erp_plants = load_excel(file_erp_plants)
+    st.set_page_config(page_title="Freight Cost Dashboard", layout="wide")
+    st.title("Freight Cost Dashboard")
 
-    df_tm = load_excel(file_tm)
-    df_fo = load_excel(file_tm_fo)
-    df_fb = load_excel(file_tm_fb)
-
-    transformed_frames = []
-
-    # Manual accruals
-    if df_manual is not None:
-        try:
-            df_manual_t = transform_manual_accruals(df_manual)
-            transformed_frames.append(df_manual_t)
-        except Exception as e:
-            st.error(f"Error transforming Manual accruals: {e}")
-
-    # SAP ERP
-    if all(x is not None for x in [df_erp, df_erp_carrier, df_erp_shpt, df_erp_customers, df_erp_plants]):
-        try:
-            df_erp_t = transform_sap_erp(
-                df_erp,
-                df_erp_carrier,
-                df_erp_shpt,
-                df_erp_customers,
-                df_erp_plants,
-            )
-            transformed_frames.append(df_erp_t)
-        except Exception as e:
-            st.error(f"Error transforming SAP ERP: {e}")
-    elif df_erp is not None:
-        st.warning("SAP ERP file uploaded but one or more reference master files are missing.")
-
-    # SAP TM
-    if all(x is not None for x in [df_tm, df_fo, df_fb]):
-        try:
-            df_tm_t = transform_sap_tm(df_tm, df_fo, df_fb)
-            transformed_frames.append(df_tm_t)
-        except Exception as e:
-            st.error(f"Error transforming SAP TM: {e}")
-    elif df_tm is not None:
-        st.warning("SAP TM file uploaded but TM FO and/or TM FB files are missing.")
-
-    if not transformed_frames:
-        st.info("Upload the required files in the sidebar to see the dashboard.")
-        return
-
-    df_all = pd.concat(transformed_frames, ignore_index=True)
-
-    # Apply date filter
-    if "Date" in df_all.columns:
-        df_all["Date"] = pd.to_datetime(df_all["Date"], errors="coerce")
-        if date_from is not None:
-            df_all = df_all[df_all["Date"] >= pd.to_datetime(date_from)]
-        if date_to is not None:
-            df_all = df_all[df_all["Date"] <= pd.to_datetime(date_to)]
-
-    st.subheader("Consolidated freight costs")
-
-    st.dataframe(df_all)
-
-    # KPIs
-    total_cost = df_all["Value"].sum(skipna=True)
-    total_shipments = len(df_all)
-    unique_carriers = df_all["Carrier"].nunique(dropna=True)
-
-    col1, col2, col3 = st.columns(3)
-    col1.metric("Total cost", f"{total_cost:,.2f}")
-    col2.metric("Number of shipments", f"{total_shipments}")
-    col3.metric("Number of carriers", f"{unique_carriers}")
-
-    # Slice & dice
-    st.markdown("### Slice & dice")
-
-    col_f1, col_f2, col_f3 = st.columns(3)
-    with col_f1:
-        carrier_filter = st.multiselect(
-            "Carrier",
-            options=sorted(df_all["Carrier"].dropna().unique()),
-            default=None,
-        )
-    with col_f2:
-        type_filter = st.multiselect(
-            "Type of goods",
-            options=sorted(df_all["Type of goods"].dropna().unique()),
-            default=None,
-        )
-    with col_f3:
-        origin_filter = st.multiselect(
-            "Origin",
-            options=sorted(df_all["Origin"].dropna().unique()),
-            default=None,
-        )
-
-    dest_filter = st.multiselect(
-        "Destination",
-        options=sorted(df_all["Destination"].dropna().unique()),
-        default=None,
+    st.markdown(
+        """
+This app consolidates freight cost information from **Manual Accruals**, **SAP ERP**, and **SAP TM**
+into a single view so you can slice and dice by carrier, type of goods, date, origin, and destination.
+"""
     )
 
-    df_filtered = df_all.copy()
-    if carrier_filter:
-        df_filtered = df_filtered[df_filtered["Carrier"].isin(carrier_filter)]
-    if type_filter:
-        df_filtered = df_filtered[df_filtered["Type of goods"].isin(type_filter)]
-    if origin_filter:
-        df_filtered = df_filtered[df_filtered["Origin"].isin(origin_filter)]
-    if dest_filter:
-        df_filtered = df_filtered[df_filtered["Destination"].isin(dest_filter)]
+    st.markdown("### 1. Upload mapping files")
+    col1, col2, col3 = st.columns(3)
 
-    st.subheader("Filtered data")
-    st.dataframe(df_filtered)
+    with col1:
+        file_carrier = st.file_uploader(
+            "ERP Carrier Name (XLSX)", type=["xlsx"], key="carrier"
+        )
+        file_shippt = st.file_uploader(
+            "ERP Shipping Point (XLSX)", type=["xlsx"], key="shippt"
+        )
+    with col2:
+        file_plants = st.file_uploader(
+            "ERP Plants (XLSX)", type=["xlsx"], key="plants"
+        )
+        file_customers = st.file_uploader(
+            "ERP Customers (XLSX)", type=["xlsx"], key="customers"
+        )
+    with col3:
+        st.write("Mapping files are required for SAP ERP transformation.")
 
-    # Charts
-    st.markdown("### Cost by carrier")
-    if not df_filtered.empty:
-        cost_by_carrier = df_filtered.groupby("Carrier", dropna=False)["Value"].sum().reset_index()
-        cost_by_carrier = cost_by_carrier.sort_values("Value", ascending=False)
-        st.bar_chart(cost_by_carrier.set_index("Carrier"))
+    st.markdown("### 2. Upload source data files")
+    col4, col5, col6 = st.columns(3)
 
-        st.markdown("### Cost by type of goods")
-        cost_by_type = df_filtered.groupby("Type of goods", dropna=False)["Value"].sum().reset_index()
-        cost_by_type = cost_by_type.sort_values("Value", ascending=False)
-        st.bar_chart(cost_by_type.set_index("Type of goods"))
+    with col4:
+        file_manual = st.file_uploader(
+            "Manual accruals (XLSX)", type=["xlsx"], key="manual"
+        )
+        file_erp = st.file_uploader("SAP ERP (XLSX)", type=["xlsx"], key="erp")
+    with col5:
+        file_tm = st.file_uploader("SAP TM (XLSX)", type=["xlsx"], key="tm")
+    with col6:
+        file_tm_fo = st.file_uploader("TM FO (XLSX)", type=["xlsx"], key="tmfo")
+        file_tm_fb = st.file_uploader("TM FB (XLSX)", type=["xlsx"], key="tmfb")
 
-        st.markdown("### Cost over time")
-        cost_over_time = df_filtered.copy()
-        cost_over_time = cost_over_time.dropna(subset=["Date"])
-        if not cost_over_time.empty:
-            cost_over_time = cost_over_time.groupby("Date")["Value"].sum().reset_index()
-            cost_over_time = cost_over_time.sort_values("Date")
-            st.line_chart(cost_over_time.set_index("Date"))
-        else:
-            st.info("No valid dates available to plot cost over time.")
-    else:
-        st.info("No data after applying filters.")
+    if not any(
+        [file_manual, file_erp, file_tm and file_tm_fo and file_tm_fb]
+    ):
+        st.info("Upload at least one data source to start.")
+        return
+
+    dfs = []
+
+    # Manual accruals
+    if file_manual is not None:
+        df_manual_raw = pd.read_excel(file_manual)
+        df_manual = transform_manual_accruals(df_manual_raw)
+        dfs.append(df_manual)
+
+    # SAP ERP
+    if (
+        file_erp is not None
+        and file_carrier is not None
+        and file_shippt is not None
+        and file_plants is not None
+        and file_customers is not None
+    ):
+        df_erp_raw = pd.read_excel(file_erp)
+        df_carrier = pd.read_excel(file_carrier)
+        df_shippt = pd.read_excel(file_shippt)
+        df_plants = pd.read_excel(file_plants)
+        df_customers = pd.read_excel(file_customers)
+
+        df_erp = transform_sap_erp(
+            df_erp_raw, df_carrier, df_shippt, df_plants, df_customers
+        )
+        dfs.append(df_erp)
+    elif file_erp is not None:
+        st.warning(
+            "SAP ERP file uploaded but one or more mapping files are missing. "
+            "SAP ERP data will not be included."
+        )
+
+    # SAP TM
+    if file_tm is not None and file_tm_fo is not None and file_tm_fb is not None:
+        df_tm_raw = pd.read_excel(file_tm)
+        df_tm_fo = pd.read_excel(file_tm_fo)
+        df_tm_fb = pd.read_excel(file_tm_fb)
+
+        df_tm = transform_sap_tm(df_tm_raw, df_tm_fo, df_tm_fb)
+        dfs.append(df_tm)
+    elif file_tm is not None:
+        st.warning(
+            "SAP TM file uploaded but TM FO and/or TM FB are missing. "
+            "SAP TM data will not be included."
+        )
+
+    if not dfs:
+        st.error("No valid dataset could be built. Please check your uploads.")
+        return
+
+    df_all = pd.concat(dfs, ignore_index=True)
+    df_all = df_all.dropna(subset=["Date"])
+
+    build_dashboard(df_all)
 
 
 if __name__ == "__main__":
