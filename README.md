@@ -1,47 +1,58 @@
-# Freight Cost Analytics App
+# Freight Cost Dashboard
 
-This app consolidates freight cost information from three different sources:
+This application consolidates freight cost information from three different sources:
 
 - **Manual accruals**
 - **SAP ERP**
-- **SAP TM** (with TM FO and TM FB as reference)
+- **SAP TM (with TM FO and TM FB)**
 
-It applies the business rules you described to harmonize the data into a single model and
-provides an interactive dashboard to analyze **actual freight costs spent in a period**,
-with rich filtering to slice and dice by carrier, type of goods, origin, destination, and currency.
+It produces a unified dataset with:
+
+- **Carrier**
+- **Type of goods**
+- **Date**
+- **Origin**
+- **Destination**
+- **Value**
+- **Currency**
+- **Source System**
+
+and provides an interactive dashboard to slice and dice freight spend.
 
 ---
 
 ## 1. Features
 
-- **Multi‑source consolidation**
-  - Manual accruals
-  - SAP ERP (with lookups to ERP Carrier Name, ERP Plants, ERP Shipping Point, ERP Customers)
-  - SAP TM (with TM FO and TM FB for date/origin/destination)
+- **Data consolidation**
+  - Merges cost data from Manual Accruals, SAP ERP, and SAP TM.
+  - Uses mapping tables (carriers, shipping points, plants, customers) to enrich ERP data.
+  - Uses TM FO / TM FB to enrich SAP TM data with dates, origins, and destinations.
 
-- **Unified data model**
-  - `Date`
-  - `Carrier`
-  - `Type of goods`
-  - `Origin`
-  - `Destination`
-  - `Value` (freight cost)
-  - `Currency`
-  - `Source System` (Manual accruals / SAP ERP / SAP TM)
+- **Standardized output**
+  - Common schema across all sources:
+    - `Source System`
+    - `Carrier`
+    - `Type of goods`
+    - `Date`
+    - `Origin`
+    - `Destination`
+    - `Value`
+    - `Currency`
 
 - **Interactive dashboard**
-  - Date range filter
-  - Carrier filter
-  - Type of goods filter
-  - Origin / Destination filters
-  - Currency filter (no FX conversion, just selection)
-  - KPIs and charts:
-    - Total freight cost
-    - Costs by carrier
-    - Costs by type of goods
-    - Costs over time
-    - Top origin–destination lanes
-    - Raw data table
+  - Filter by:
+    - Date range
+    - Carrier
+    - Type of goods
+    - Origin
+    - Destination
+    - Source system
+  - Visuals:
+    - Total freight cost KPI
+    - Cost over time
+    - Top carriers by cost
+    - Top lanes (Origin → Destination) by cost
+    - Detailed table of all filtered records
 
 ---
 
@@ -49,15 +60,15 @@ with rich filtering to slice and dice by carrier, type of goods, origin, destina
 
 ### 2.1. Prerequisites
 
-- Python 3.10+ recommended
-- `pip` installed
+- Python 3.9+ recommended
+- Ability to install Python packages (e.g. via `pip`)
 
 ### 2.2. Setup
 
 ```bash
 # Create and activate a virtual environment (optional but recommended)
-python -m venv .venv
-source .venv/bin/activate  # on Windows: .venv\Scripts\activate
+python -m venv venv
+source venv/bin/activate  # on Windows: venv\Scripts\activate
 
 # Install dependencies
 pip install -r requirements.txt
