@@ -136,4 +136,4 @@ def transform_tm(tm_df, fo_df, fb_df):
         fb["Date"] = safe_date(fb["Expected Arrival Date"])
 
     fb["Origin"] = fb.get("Source Location Description")
-    fb["Destination
+    fb["Destination"]
